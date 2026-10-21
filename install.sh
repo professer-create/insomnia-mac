@@ -37,9 +37,9 @@ rm -rf "$APP"
 mv "$BUILD/Insomnia.app" "$APP"
 rm -rf "$BUILD"
 
-echo "3/4  Launch agents (backstop every minute, menu bar app at login)"
+echo "3/4  Launch agents (backstop every minute, network guard, menu bar app at login)"
 mkdir -p "$AGENTS"
-for name in backstop menubar; do
+for name in backstop netguard menubar; do
   plist="$AGENTS/com.usman.insomnia.$name.plist"
   sed "s|__HOME__|$HOME|g" "$HERE/launchd/com.usman.insomnia.$name.plist" > "$plist"
   launchctl bootout "gui/$USER_ID/com.usman.insomnia.$name" 2>/dev/null || true

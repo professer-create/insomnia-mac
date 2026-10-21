@@ -13,6 +13,10 @@
 #   insomnia setup         print the one command that needs your password
 #   insomnia backstop      run by launchd every minute: timer, battery floor,
 #                          and re-apply if macOS flipped the bit back
+#   insomnia netguard      run by launchd while a session is on: pings the
+#                          router every 5 s and restarts Wi-Fi when the link
+#                          has been dead for 30 s, so a dropped connection
+#                          comes back on its own
 #
 # Needs a sudoers rule (written by `insomnia setup`) that lets this user run
 # exactly two commands without a password:
@@ -32,6 +36,10 @@ SUDO=/usr/bin/sudo
 VISUDO=/usr/sbin/visudo
 BATTERY_FLOOR="${INSOMNIA_BATTERY_FLOOR:-10}"   # on battery, end the session at or below this %
 SETTLE=5                                        # seconds to wait before reading the bit back
+NETGUARD_LOG="$LOG_DIR/netguard.log"
+NET_PROBE_INTERVAL=5     # seconds between probes while a session is on
+NET_DOWN_AFTER=20        # seconds without any reply before the link is called down
+NET_REPAIR_AFTER=30      # seconds without any reply before Wi-Fi is restarted
 
 log() { mkdir -p "$LOG_DIR"; printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG"; }
 die() { echo "insomnia: $*" >&2; exit 1; }
@@ -131,6 +139,7 @@ cmd_on() {
     echo "Awake: this Mac keeps running with the lid closed until $(fmt_end "$end")."
   fi
   echo "Keep it on a desk or stand, not in a bag. On battery it stops at ${BATTERY_FLOOR}%."
+  echo "The network guard now pings the router every ${NET_PROBE_INTERVAL}s and restarts Wi-Fi if the link dies for ${NET_REPAIR_AFTER}s."
 }
 
 cmd_off() {
@@ -166,6 +175,93 @@ cmd_status() {
   fi
   read -r pct state <<< "$(battery_info)"
   echo "Battery: ${pct}% ($state). Floor: ${BATTERY_FLOOR}%."
+  if launchctl print "gui/$(id -u)/com.usman.insomnia.netguard" 2>/dev/null | grep -q "state = running"; then
+    echo "Network guard: running ($(wifi_state))."
+  else
+    echo "Network guard: NOT running."
+  fi
+  if [ -f "$NETGUARD_LOG" ]; then
+    echo "Network guard log (last 3):"
+    tail -3 "$NETGUARD_LOG" | sed 's/^/  /'
+  fi
+}
+
+# ---------- network guard ----------
+
+nlog() { mkdir -p "$LOG_DIR"; printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$NETGUARD_LOG"; }
+
+wifi_interface() {
+  local ifname
+  ifname="$(networksetup -listallhardwareports 2>/dev/null | awk '/^Hardware Port: Wi-Fi/{getline; print $2; exit}')"
+  echo "${ifname:-en0}"
+}
+
+gateway_ip() { route -n get default 2>/dev/null | awk '/gateway:/{print $2; exit}'; }
+
+# One probe: the router first (cheapest, proves the Wi-Fi link), then two
+# public resolvers (proves the internet). Any reply counts as up.
+probe() {
+  local gw
+  gw="$(gateway_ip)"
+  if [ -n "$gw" ] && ping -c 1 -W 1500 -q "$gw" >/dev/null 2>&1; then return 0; fi
+  ping -c 1 -W 1500 -q 1.1.1.1 >/dev/null 2>&1 && return 0
+  ping -c 1 -W 1500 -q 8.8.8.8 >/dev/null 2>&1 && return 0
+  return 1
+}
+
+# macOS 15 hides the SSID from command line tools without Location Services,
+# so the state is power, link and IP only.
+wifi_state() {
+  local ifname power ip link
+  ifname="$(wifi_interface)"
+  power="$(networksetup -getairportpower "$ifname" 2>/dev/null | awk 'NR==1{print $NF}')"
+  ip="$(ipconfig getifaddr "$ifname" 2>/dev/null)"
+  link="$(ifconfig "$ifname" 2>/dev/null | awk '/status:/{print $2}')"
+  echo "$ifname power=${power:-?} ip=${ip:-none} link=${link:-?}"
+}
+
+wifi_restart() {
+  local ifname
+  ifname="$(wifi_interface)"
+  networksetup -setairportpower "$ifname" off >/dev/null 2>&1
+  sleep 3
+  networksetup -setairportpower "$ifname" on >/dev/null 2>&1
+}
+
+# Long-running; launchd keeps it alive. Idle while no session is on.
+cmd_netguard() {
+  local now first_fail=0 declared_down=0 repairs=0 last_repair=0 down_for wait
+  nlog "netguard started: probe every ${NET_PROBE_INTERVAL}s, down after ${NET_DOWN_AFTER}s, Wi-Fi restart after ${NET_REPAIR_AFTER}s ($(wifi_state))"
+  while :; do
+    if [ ! -f "$STATE" ]; then
+      sleep 30
+      continue
+    fi
+    now="$(date +%s)"
+    if probe; then
+      if [ "$declared_down" = 1 ]; then
+        nlog "network BACK after $(( now - first_fail ))s, Wi-Fi restarts: $repairs ($(wifi_state))"
+      fi
+      first_fail=0; declared_down=0; repairs=0
+    else
+      [ "$first_fail" -eq 0 ] && first_fail="$now"
+      down_for=$(( now - first_fail ))
+      if [ "$declared_down" = 0 ] && [ "$down_for" -ge "$NET_DOWN_AFTER" ]; then
+        declared_down=1
+        nlog "network DOWN for ${down_for}s ($(wifi_state))"
+      fi
+      if [ "$down_for" -ge "$NET_REPAIR_AFTER" ]; then
+        wait=60
+        [ "$repairs" -ge 3 ] && wait=300    # after three tries, back off to every 5 min
+        if [ "$repairs" -eq 0 ] || [ $(( now - last_repair )) -ge "$wait" ]; then
+          repairs=$(( repairs + 1 )); last_repair="$now"
+          nlog "restarting Wi-Fi (attempt $repairs, down ${down_for}s)"
+          wifi_restart
+        fi
+      fi
+    fi
+    sleep "$NET_PROBE_INTERVAL"
+  done
 }
 
 # Runs every minute from launchd. Only ever acts while a session file exists,
@@ -208,6 +304,7 @@ case "${1:-status}" in
   off)       cmd_off ;;
   status)    cmd_status ;;
   backstop)  cmd_backstop ;;
+  netguard)  cmd_netguard ;;
   setup)     cmd_setup ;;
   -h|--help|help) usage ;;
   *)         usage; exit 1 ;;

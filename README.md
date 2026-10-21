@@ -50,6 +50,29 @@ insomnia status
 
 Or click the eye in the menu bar.
 
+## Lock on lid close
+
+With sleep disabled, closing the lid no longer locks the screen by itself,
+so anyone could open the lid and use the Mac. The menu bar app watches the
+lid through IOKit and, when it closes, locks the screen the same way
+Control-Command-Q does (processes keep running; opening the lid shows the
+password screen). It is on by default; "Lock Screen When Lid Closes" in the
+menu turns it off, for example while using an external display in clamshell
+mode. "Lock Screen Now" (Command-L in the menu) tests it.
+
+## Network guard
+
+An awake Mac can still lose Wi-Fi: on an Intel MacBook the link sometimes
+drops while the display is off and nothing is using it, and macOS can sit
+unassociated for minutes before it rejoins. While a session is on, the
+`com.usman.insomnia.netguard` agent pings the router every 5 seconds (which
+also keeps the link from idling). If nothing answers for 30 seconds it turns
+Wi-Fi off and on, which forces a fresh join and DHCP lease; it retries every
+minute, then every 5 minutes. Everything is written to
+`~/Library/Logs/Insomnia/netguard.log`, and `insomnia status` shows the last
+lines. It needs no password: `networksetup -setairportpower` works for an
+admin user.
+
 ## Safety
 
 - Keep the Mac on a desk or stand while the lid is closed, never in a bag.

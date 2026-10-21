@@ -1,13 +1,21 @@
 // Insomnia menu bar app: an eye icon that keeps this Mac awake with the lid
 // closed. All privileged work goes through the `insomnia` command line tool,
 // so this app itself never needs a password.
+//
+// It also watches the lid. With sleep disabled, closing the lid no longer
+// locks the screen by itself, so when the lid closes this app locks the
+// screen the same way Control-Command-Q does. Processes keep running; the
+// next person to open the lid sees the password screen.
 import AppKit
 import Foundation
+import IOKit
+import IOKit.pwr_mgt
 
 let cli = "/usr/local/bin/insomnia"
 let bundleID = "com.usman.insomnia"
 let stateFile = NSString(string: "~/Library/Application Support/Insomnia/session").expandingTildeInPath
 let logFile = NSString(string: "~/Library/Logs/Insomnia/insomnia.log").expandingTildeInPath
+let lockOnLidCloseKey = "lockOnLidClose"
 
 struct CommandResult {
     let status: Int32
@@ -31,6 +39,22 @@ func run(_ executable: String, _ arguments: [String]) -> CommandResult {
     return CommandResult(status: process.terminationStatus, output: String(decoding: data, as: UTF8.self))
 }
 
+func appendLog(_ message: String) {
+    let dir = (logFile as NSString).deletingLastPathComponent
+    try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    let formatter = DateFormatter()
+    formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+    let line = "\(formatter.string(from: Date())) app: \(message)\n"
+    guard let data = line.data(using: .utf8) else { return }
+    if let handle = FileHandle(forWritingAtPath: logFile) {
+        handle.seekToEndOfFile()
+        handle.write(data)
+        handle.closeFile()
+    } else {
+        FileManager.default.createFile(atPath: logFile, contents: data)
+    }
+}
+
 func sleepDisabled() -> Bool {
     let result = run("/usr/bin/pmset", ["-g"])
     for line in result.output.split(separator: "\n") {
@@ -50,17 +74,116 @@ func sessionEnd() -> Date? {
     return Date(timeIntervalSince1970: seconds)
 }
 
+/// Locks the screen through the login framework, exactly what Control-Command-Q
+/// and the Lock Screen menu item do. Nothing is put to sleep.
+@discardableResult
+func lockScreen() -> Bool {
+    guard let handle = dlopen("/System/Library/PrivateFrameworks/login.framework/login", RTLD_NOW),
+          let symbol = dlsym(handle, "SACLockScreenImmediate") else {
+        appendLog("lock failed: SACLockScreenImmediate not found")
+        return false
+    }
+    typealias LockFunction = @convention(c) () -> Int32
+    let lock = unsafeBitCast(symbol, to: LockFunction.self)
+    let result = lock()
+    appendLog("screen lock requested (result \(result))")
+    return true
+}
+
+/// Lid open/close events. IOPMrootDomain posts kIOPMMessageClamshellStateChange
+/// to its general-interest clients (not to IORegisterForSystemPower clients,
+/// which only get sleep/wake messages). As a fallback the AppleClamshellState
+/// property is also polled every two seconds, so a missed notification still
+/// produces an event. Each transition fires exactly once.
+final class LidWatcher {
+    // Function-like C macros, which Swift cannot import; values checked
+    // against the IOKit headers on macOS 15.
+    static let clamshellChange: UInt32 = 0xE003_4100    // kIOPMMessageClamshellStateChange
+    static let clamshellClosedBit: UInt = 0x1           // kClamshellStateBit
+
+    var onLidClosed: (() -> Void)?
+    var onLidOpened: (() -> Void)?
+    private var rootDomain: io_service_t = 0
+    private var notifyPort: IONotificationPortRef?
+    private var notifier: io_object_t = 0
+    private var pollTimer: Timer?
+    private var lastClosed: Bool?
+
+    /// Returns which of the two sources could be started.
+    func start() -> (notifications: Bool, polling: Bool) {
+        rootDomain = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOPMrootDomain"))
+        guard rootDomain != 0 else { return (false, false) }
+        lastClosed = readClosed()
+
+        var notifications = false
+        if let port = IONotificationPortCreate(kIOMainPortDefault) {
+            notifyPort = port
+            let refcon = Unmanaged.passUnretained(self).toOpaque()
+            let kr = IOServiceAddInterestNotification(port, rootDomain, "IOGeneralInterest", { refcon, _, messageType, argument in
+                guard let refcon = refcon else { return }
+                let watcher = Unmanaged<LidWatcher>.fromOpaque(refcon).takeUnretainedValue()
+                watcher.handle(messageType: messageType, argument: argument)
+            }, refcon, &notifier)
+            if kr == KERN_SUCCESS {
+                let source = IONotificationPortGetRunLoopSource(port).takeUnretainedValue()
+                CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
+                notifications = true
+            }
+        }
+
+        pollTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+            guard let self = self, let closed = self.readClosed() else { return }
+            self.update(closed: closed, source: "poll")
+        }
+        return (notifications, pollTimer != nil)
+    }
+
+    private func readClosed() -> Bool? {
+        guard rootDomain != 0,
+              let unmanaged = IORegistryEntryCreateCFProperty(rootDomain, "AppleClamshellState" as CFString, kCFAllocatorDefault, 0)
+        else { return nil }
+        let value = unmanaged.takeRetainedValue()
+        if let number = value as? NSNumber { return number.boolValue }
+        return nil
+    }
+
+    private func handle(messageType: UInt32, argument: UnsafeMutableRawPointer?) {
+        guard messageType == Self.clamshellChange else { return }
+        let closed = (UInt(bitPattern: argument) & Self.clamshellClosedBit) != 0
+        update(closed: closed, source: "notification")
+    }
+
+    private func update(closed: Bool, source: String) {
+        guard closed != lastClosed else { return }
+        lastClosed = closed
+        appendLog("lid \(closed ? "closed" : "opened") (\(source))")
+        if closed {
+            onLidClosed?()
+        } else {
+            onLidOpened?()
+        }
+    }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private var timer: Timer?
+    private let lidWatcher = LidWatcher()
     private let statusLine = NSMenuItem(title: "Checking…", action: nil, keyEquivalent: "")
     private let endLine = NSMenuItem(title: "", action: nil, keyEquivalent: "")
     private let toggleItem = NSMenuItem(title: "Keep Awake With Lid Closed", action: #selector(toggle), keyEquivalent: "")
+    private let lockOnLidItem = NSMenuItem(title: "Lock Screen When Lid Closes", action: #selector(toggleLockOnLidClose), keyEquivalent: "")
     private let formatter: DateFormatter = {
         let f = DateFormatter()
         f.dateFormat = "EEE d MMM, HH:mm"
         return f
     }()
+
+    private var lockOnLidClose: Bool {
+        let defaults = UserDefaults.standard
+        if defaults.object(forKey: lockOnLidCloseKey) == nil { return true }
+        return defaults.bool(forKey: lockOnLidCloseKey)
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         if NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).count > 1 {
@@ -98,6 +221,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(timedItem)
         menu.addItem(.separator())
 
+        lockOnLidItem.target = self
+        menu.addItem(lockOnLidItem)
+        let lockNowItem = NSMenuItem(title: "Lock Screen Now", action: #selector(lockNow), keyEquivalent: "l")
+        lockNowItem.target = self
+        menu.addItem(lockNowItem)
+        menu.addItem(.separator())
+
         let logItem = NSMenuItem(title: "Open Log", action: #selector(openLog), keyEquivalent: "")
         logItem.target = self
         menu.addItem(logItem)
@@ -110,6 +240,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         timer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
             self?.refresh()
         }
+
+        lidWatcher.onLidClosed = { [weak self] in
+            guard let self = self else { return }
+            if self.lockOnLidClose {
+                appendLog("locking screen")
+                lockScreen()
+            } else {
+                appendLog("lock on lid close is off, not locking")
+            }
+        }
+        let sources = lidWatcher.start()
+        appendLog("started, lid watcher: notifications \(sources.notifications ? "on" : "FAILED"), polling \(sources.polling ? "on" : "FAILED")")
     }
 
     func menuWillOpen(_ menu: NSMenu) {
@@ -129,6 +271,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             statusItem.button?.title = on ? "👁" : "zz"
         }
         toggleItem.state = on ? .on : .off
+        lockOnLidItem.state = lockOnLidClose ? .on : .off
         if on {
             statusLine.title = "Awake: lid closed, Mac keeps running"
             if let end = sessionEnd() {
@@ -185,6 +328,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         runCLI(["on", arg])
     }
 
+    @objc func toggleLockOnLidClose() {
+        let newValue = !lockOnLidClose
+        UserDefaults.standard.set(newValue, forKey: lockOnLidCloseKey)
+        lockOnLidItem.state = newValue ? .on : .off
+        appendLog("lock on lid close turned \(newValue ? "on" : "off")")
+    }
+
+    @objc func lockNow() {
+        lockScreen()
+    }
+
     @objc func openLog() {
         let dir = (logFile as NSString).deletingLastPathComponent
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
@@ -201,7 +355,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         let alert = NSAlert()
         alert.messageText = "This Mac is set to stay awake with the lid closed"
-        alert.informativeText = "Quitting only closes the menu bar icon. The timer and battery floor keep working in the background. Do you want sleep back to normal before quitting?"
+        alert.informativeText = "Quitting closes the menu bar icon and stops lock-on-lid-close. The timer and battery floor keep working in the background. Do you want sleep back to normal before quitting?"
         alert.addButton(withTitle: "Restore Normal Sleep and Quit")
         alert.addButton(withTitle: "Keep Awake and Quit")
         alert.addButton(withTitle: "Cancel")
